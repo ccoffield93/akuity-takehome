@@ -1,6 +1,24 @@
 This document is to keep a record of the design approach taken when designing this controller/CRD. I will aim to include a small blurb for every commit pushed to the repository. 
 
+All development is performed on an OpenSUSE WSL installation, using minikube to test controller behavior and validate the code/CRD. 
+
 Initial commit included only the ASSIGNMENT.md that was provided as a guideline for the coding challenge. 
 
 Next step was to create a baseline custom resource definition for the NamespaceClass. I used the following blog to come up with a simple CRD, modifying the base example to : https://medium.com/@disha.20.10/building-and-extending-kubernetes-a-writing-first-custom-controller-with-go-bc57a50d61f7 . At this stage, the CRD does not meet the criteria needed for the assignment, and serves as a base to build on and add fields. 
 
+Following this, I had Claude generate a basic controller that monitors namespaces, printing their labels any time they're modified. This follows what I believe to be a healthy use of AI tooling: boilerplate code that gets the hooks in the right places but doesn't immediately surge past understanding of the problem/solution.
+Running this controller locally, I validated that it retrieves all namespaces, detects when new ones are added, and successfully accesses their labels:
+
+  kubernetes.io/metadata.name=kube-public
+Controller started, watching namespaces...
+[ADDED] Namespace: kube-system
+  kubernetes.io/metadata.name=kube-system
+[ADDED] Namespace: default
+  kubernetes.io/metadata.name=default
+[ADDED] Namespace: dummy-ns
+  kubernetes.io/metadata.name=dummy-ns
+[MODIFIED] Namespace: dummy-ns
+  kubernetes.io/metadata.name=dummy-ns
+  namespaceclass.akuity.io/name=test-nsc
+
+However, this approach is too simple, and lacks the Reconcile functionality needed for handling edits in the cluster. I committed here, but changes are necessary.
