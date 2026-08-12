@@ -6,68 +6,142 @@ import (
 	"path/filepath"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/client-go/util/workqueue"
 )
 
-// Controller watches Namespaces and reconciles them through a workqueue,
-// which is the standard client-go controller pattern: the informer only
-// enqueues keys, and a separate worker loop does the actual work with
-// retry/backoff on failure.
-type Controller struct {
-	clientset kubernetes.Interface
-	informer  cache.SharedIndexInformer
-	lister    cache.GenericLister
-	queue     workqueue.RateLimitingInterface
+// This controller assumes NamespaceClass is a CRD like:
+//
+//	apiVersion: apiextensions.k8s.io/v1
+//	kind: CustomResourceDefinition
+//	metadata:
+//	  name: namespaceclasses.example.com
+//	spec:
+//	  group: example.com
+//	  versions: [{name: v1alpha1, served: true, storage: true}]
+//	  scope: Cluster
+//	  names: {plural: namespaceclasses, singular: namespaceclass, kind: NamespaceClass}
+//
+// and that Namespaces opt into a class via a label:
+//
+//	metadata:
+//	  labels:
+//	    namespaceclass.example.com/name: my-class
+//
+// Rather than generating a typed clientset for this one CRD, this uses the
+// dynamic client + dynamicinformer, which works against unstructured objects
+// for any GVR without codegen. That's the simplest path for "a controller
+// that also watches one CRD"; if NamespaceClass grows real business logic,
+// switch to a generated clientset (client-gen) for compile-time typing.
+
+var namespaceGVR = schema.GroupVersionResource{
+	Group:    "",
+	Version:  "v1",
+	Resource: "namespaces",
 }
 
-func NewController(clientset kubernetes.Interface, informer cache.SharedIndexInformer) *Controller {
-	c := &Controller{
-		clientset: clientset,
-		informer:  informer,
-		queue:     workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+var namespaceClassGVR = schema.GroupVersionResource{
+	Group:    "myk8s.io",
+	Version:  "v1",
+	Resource: "namespaceclasses",
+}
+
+const namespaceClassLabel = "namespaceclass.akuity.io/name"
+
+// queueKey tags each workqueue entry with which resource it refers to, so a
+// single shared queue/worker pool can drive reconciliation for both types.
+type queueKey struct {
+	kind string // "Namespace" or "NamespaceClass"
+	name string // namespace name, or namespaceclass name (both cluster-scoped)
+}
+
+type Controller struct {
+	dynamicClient   dynamic.Interface
+	nsInformer      cache.SharedIndexInformer
+	nsClassInformer cache.SharedIndexInformer
+	nsClassIndexer  cache.Indexer // indexed so we can find namespaces by class cheaply
+	queue           workqueue.RateLimitingInterface
+}
+
+// nsClassNameIndexer indexes Namespace objects by the class they reference,
+// so that when a NamespaceClass changes we can look up every Namespace that
+// points at it without a full O(n) scan on every reconcile.
+const byNamespaceClassIndex = "byNamespaceClass"
+
+func nsClassNameIndexFunc(obj interface{}) ([]string, error) {
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil, nil
+	}
+	labels := u.GetLabels()
+	class, ok := labels[namespaceClassLabel]
+	if !ok || class == "" {
+		return nil, nil
+	}
+	return []string{class}, nil
+}
+
+func NewController(dynamicClient dynamic.Interface, factory dynamicinformer.DynamicSharedInformerFactory) *Controller {
+	nsInformer := factory.ForResource(namespaceGVR).Informer()
+	nsClassInformer := factory.ForResource(namespaceClassGVR).Informer()
+
+	if err := nsInformer.AddIndexers(cache.Indexers{
+		byNamespaceClassIndex: nsClassNameIndexFunc,
+	}); err != nil {
+		panic(err)
 	}
 
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.enqueue,
-		UpdateFunc: func(old, new interface{}) { c.enqueue(new) },
-		// no DeleteFunc needed since we only care about create/modify,
-		// but you'd add one here (using cache.DeletionHandlingMetaNamespaceKeyFunc)
-		// if the reconciler needed to clean anything up.
+	c := &Controller{
+		dynamicClient:   dynamicClient,
+		nsInformer:      nsInformer,
+		nsClassInformer: nsClassInformer,
+		nsClassIndexer:  nsInformer.GetIndexer(),
+		queue:           workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+	}
+
+	nsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { c.enqueue("Namespace", obj) },
+		UpdateFunc: func(old, new interface{}) { c.enqueue("Namespace", new) },
+		DeleteFunc: func(obj interface{}) { c.enqueue("Namespace", obj) },
+	})
+
+	nsClassInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { c.enqueue("NamespaceClass", obj) },
+		UpdateFunc: func(old, new interface{}) { c.enqueue("NamespaceClass", new) },
+		DeleteFunc: func(obj interface{}) { c.enqueue("NamespaceClass", obj) },
 	})
 
 	return c
 }
 
-// enqueue converts the object into a namespace/name key and adds it to the
-// queue. Using a string key (rather than the object itself) means that if
-// the same namespace changes multiple times before it's processed, it only
-// gets reconciled once with the latest state — deduplication is automatic.
-func (c *Controller) enqueue(obj interface{}) {
-	key, err := cache.MetaNamespaceKeyFunc(obj)
+func (c *Controller) enqueue(kind string, obj interface{}) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		runtime.HandleError(err)
 		return
 	}
-	c.queue.Add(key)
+	// Both types are cluster-scoped, so key is just the name (no "ns/name" split needed).
+	c.queue.Add(queueKey{kind: kind, name: key})
 }
 
-// Run starts the informer and the worker pool, and blocks until stopCh is closed.
 func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
 	defer runtime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	go c.informer.Run(stopCh)
+	go c.nsInformer.Run(stopCh)
+	go c.nsClassInformer.Run(stopCh)
 
-	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
+	if !cache.WaitForCacheSync(stopCh, c.nsInformer.HasSynced, c.nsClassInformer.HasSynced) {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -82,86 +156,124 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
 	return nil
 }
 
-// runWorker repeatedly pulls items off the queue and processes them.
 func (c *Controller) runWorker() {
 	for c.processNextItem() {
 	}
 }
 
-// processNextItem handles a single queue item, including retry logic on error.
 func (c *Controller) processNextItem() bool {
-	key, shutdown := c.queue.Get()
+	item, shutdown := c.queue.Get()
 	if shutdown {
 		return false
 	}
-	defer c.queue.Done(key)
+	defer c.queue.Done(item)
 
-	err := c.reconcile(key.(string))
+	key := item.(queueKey)
+
+	var err error
+	switch key.kind {
+	case "Namespace":
+		err = c.reconcileNamespace(key.name)
+	case "NamespaceClass":
+		err = c.reconcileNamespaceClass(key.name)
+	default:
+		err = fmt.Errorf("unknown kind %q in queue", key.kind)
+	}
+
 	if err == nil {
-		// success: reset the rate limiter backoff for this key
-		c.queue.Forget(key)
+		c.queue.Forget(item)
 		return true
 	}
 
-	// failure: requeue with rate-limited backoff, up to a max number of retries
-	if c.queue.NumRequeues(key) < 5 {
-		fmt.Printf("Error reconciling %q, retrying: %v\n", key, err)
-		c.queue.AddRateLimited(key)
+	if c.queue.NumRequeues(item) < 5 {
+		fmt.Printf("Error reconciling %s %q, retrying: %v\n", key.kind, key.name, err)
+		c.queue.AddRateLimited(item)
 		return true
 	}
 
 	runtime.HandleError(err)
-	fmt.Printf("Dropping %q out of the queue after too many retries: %v\n", key, err)
-	c.queue.Forget(key)
+	fmt.Printf("Dropping %s %q out of the queue after too many retries: %v\n", key.kind, key.name, err)
+	c.queue.Forget(item)
 	return true
 }
 
-// reconcile is where the actual work happens. It's idempotent and driven
-// purely by the current state of the object (fetched fresh from the
-// informer's cache), not by the specific event that triggered it — that's
-// what makes it safe to retry and to coalesce multiple events into one run.
-func (c *Controller) reconcile(key string) error {
-	_, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		return err
-	}
-
-	obj, exists, err := c.informer.GetIndexer().GetByKey(key)
+// reconcileNamespace handles a single Namespace: prints its labels and, if it
+// references a NamespaceClass, looks that class up (from the local informer
+// cache, not a live API call) and prints it too.
+func (c *Controller) reconcileNamespace(name string) error {
+	obj, exists, err := c.nsInformer.GetIndexer().GetByKey(name)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		// Namespace was deleted between enqueue and now; nothing to do.
 		fmt.Printf("Namespace %q no longer exists, skipping\n", name)
 		return nil
 	}
+	ns := obj.(*unstructured.Unstructured)
 
-	ns, ok := obj.(*corev1.Namespace)
-	if !ok {
-		return fmt.Errorf("unexpected object type for key %q", key)
+	fmt.Printf("Reconciling Namespace: %s\n", ns.GetName())
+	labels := ns.GetLabels()
+	if len(labels) == 0 {
+		fmt.Println("  (no labels)")
+	}
+	for k, v := range labels {
+		fmt.Printf("  %s=%s\n", k, v)
 	}
 
-	printLabels(ns)
+	className, ok := labels[namespaceClassLabel]
+	if !ok || className == "" {
+		fmt.Println("  no NamespaceClass reference")
+		return nil
+	}
 
-	// This is where you'd put actual reconciling logic, e.g.:
-	//   - ensure a default label/annotation is present
-	//   - create a companion resource (ResourceQuota, NetworkPolicy, etc.)
-	//   - sync namespace metadata to an external system
-	// For a real mutation you'd typically call c.clientset.CoreV1().Namespaces().Update(...)
-	// or Patch(...) here, and re-fetch/handle conflicts (apierrors.IsConflict) on retry.
+	classObj, exists, err := c.nsClassInformer.GetIndexer().GetByKey(className)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		// Referenced class doesn't exist (yet, or was deleted). Depending on
+		// your policy this might warrant an event/condition on the namespace;
+		// returning an error here would cause a retry with backoff instead.
+		fmt.Printf("  references NamespaceClass %q, which was not found\n", className)
+		return nil
+	}
+	class := classObj.(*unstructured.Unstructured)
+	fmt.Printf("  belongs to NamespaceClass %q (spec: %v)\n", class.GetName(), class.Object["spec"])
+
+	// Real reconciling logic would go here, e.g. applying settings from the
+	// NamespaceClass spec onto the namespace (labels, annotations, quotas,
+	// network policies) via c.dynamicClient.Resource(namespaceGVR).Update(...)
+	// or Patch(...).
 
 	return nil
 }
 
-func printLabels(ns *corev1.Namespace) {
-	fmt.Printf("Reconciling namespace: %s\n", ns.Name)
-	if len(ns.Labels) == 0 {
-		fmt.Println("  (no labels)")
-		return
+// reconcileNamespaceClass handles a NamespaceClass change. Since a class
+// change can affect every namespace that references it, it looks up all
+// such namespaces via the index and re-enqueues them for reconciliation.
+func (c *Controller) reconcileNamespaceClass(name string) error {
+	obj, exists, err := c.nsClassInformer.GetIndexer().GetByKey(name)
+	if err != nil {
+		return err
 	}
-	for k, v := range ns.Labels {
-		fmt.Printf("  %s=%s\n", k, v)
+	if !exists {
+		fmt.Printf("NamespaceClass %q no longer exists, skipping\n", name)
+		return nil
 	}
+	class := obj.(*unstructured.Unstructured)
+	fmt.Printf("Reconciling NamespaceClass: %s (spec: %v)\n", class.GetName(), class.Object["spec"])
+
+	affected, err := c.nsClassIndexer.ByIndex(byNamespaceClassIndex, name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  %d namespace(s) reference this class, re-enqueuing them\n", len(affected))
+	for _, obj := range affected {
+		ns := obj.(*unstructured.Unstructured)
+		c.queue.Add(queueKey{kind: "Namespace", name: ns.GetName()})
+	}
+
+	return nil
 }
 
 func main() {
@@ -171,15 +283,14 @@ func main() {
 		panic(err.Error())
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	factory := informers.NewSharedInformerFactory(clientset, 30*time.Second)
-	nsInformer := factory.Core().V1().Namespaces().Informer()
+	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 30*time.Second)
 
-	controller := NewController(clientset, nsInformer)
+	controller := NewController(dynamicClient, factory)
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
@@ -189,6 +300,6 @@ func main() {
 	}
 }
 
-// suppress "unused import" if you remove the Update/Patch example above
 var _ = apierrors.IsConflict
 var _ = context.Background
+var _ = metav1.ListOptions{}

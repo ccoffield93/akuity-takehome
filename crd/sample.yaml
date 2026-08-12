@@ -1,0 +1,7 @@
+apiVersion: myk8s.io/v1
+kind: NamespaceClass
+metadata:
+  name: demo-namespaceclass
+  namespace: default
+spec:
+  message: "This is a sample NamespaceClass"

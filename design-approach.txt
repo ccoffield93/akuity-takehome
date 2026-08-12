@@ -39,3 +39,13 @@ Reconciling namespace: kube-system
   kubernetes.io/metadata.name=kube-node-lease
 
   This also merits a commit, but following that, I want to go through the code and make sure that I understand the decisions behind it, and add TODOs for sections that need expansion. 
+
+  The first thing to note when looking at the assignment specification and our current code is that the controller must actually monitor two types of resources: we want to take action when Namespaces change, but we also want to act when NamespaceClasses change. So, we will need to upgrade the controller to have two separate reconcile loops, one for each resource type, and we will need informers for each. Another prompt gets our boilerplate setup for "watch these resource types", which should put us in a better position to start cleaning up/expanding on the base generated code. I also created a simple NSC sample yaml to apply to the cluster so that there was NamespaceClass for the controller to pick up and monitor/reconcile. 
+It is important to note that Claude provided the following insights for its generated code, meaning it went further than simply creating a second Reconcile/informer:
+Relationship model. I assumed Namespaces opt into a class via a label (namespaceclass.example.com/name: my-class), since you didn't specify the linking mechanism — let me know if it's actually a field on a namespace annotation or something else and I'll adjust.
+One shared queue, tagged keys. Both informers feed the same workqueue, with each entry tagged {kind, name} so processNextItem dispatches to reconcileNamespace or reconcileNamespaceClass. This keeps a single worker pool instead of duplicating the loop.
+Cross-resource fan-out. This is the part that actually makes it a "real" controller for two related types: when a NamespaceClass changes, all Namespaces referencing it need re-reconciling, not just the class itself. I added a cache index (byNamespaceClassIndex) on the namespace informer, so reconcileNamespaceClass can cheaply look up affected namespaces and re-enqueue them — no full list/scan.
+Reads come from the informer cache, not the API server. Both reconcileNamespace and reconcileNamespaceClass read via GetIndexer().GetByKey(...), which is fast and doesn't hit rate limits, at the cost of possibly-slightly-stale data (bounded by informer resync).
+
+This is the point where I am jumping in to start tweaking, commenting, and making TODOs, since the basic framework (controller that monitors two types of resources for changes) has now been established. 
+
