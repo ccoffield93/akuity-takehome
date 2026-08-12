@@ -26,24 +26,18 @@ import (
 //	kind: CustomResourceDefinition
 //	metadata:
 //	  name: namespaceclasses.example.com
-//	spec:
-//	  group: example.com
-//	  versions: [{name: v1alpha1, served: true, storage: true}]
-//	  scope: Cluster
-//	  names: {plural: namespaceclasses, singular: namespaceclass, kind: NamespaceClass}
-//
+
 // and that Namespaces opt into a class via a label:
 //
 //	metadata:
 //	  labels:
-//	    namespaceclass.example.com/name: my-class
+//	    namespaceclass.akuity.io/name: my-class
 //
 // Rather than generating a typed clientset for this one CRD, this uses the
 // dynamic client + dynamicinformer, which works against unstructured objects
-// for any GVR without codegen. That's the simplest path for "a controller
-// that also watches one CRD"; if NamespaceClass grows real business logic,
-// switch to a generated clientset (client-gen) for compile-time typing.
-
+// for any GVR without codegen. 
+// TODO: Consider using client-gen to generate a typed clientset for NamespaceClass, which would give compile-time type safety and avoid the need to use unstructured.Unstructured. For a small example like this, dynamic client is simpler and avoids codegen boilerplate.
+// This would allow compile-time type safety and avoid the need to use unstructured objects.
 var namespaceGVR = schema.GroupVersionResource{
 	Group:    "",
 	Version:  "v1",
@@ -51,12 +45,14 @@ var namespaceGVR = schema.GroupVersionResource{
 }
 
 var namespaceClassGVR = schema.GroupVersionResource{
-	Group:    "myk8s.io",
+	Group:    "akuity.io",
 	Version:  "v1",
 	Resource: "namespaceclasses",
 }
 
+// This is the label that should be checked on namespaces to assign a NSC.
 const namespaceClassLabel = "namespaceclass.akuity.io/name"
+const lastNamespaceClassLabel = "namespaceclass.akuity.io/last-applied-name"
 
 // queueKey tags each workqueue entry with which resource it refers to, so a
 // single shared queue/worker pool can drive reconciliation for both types.
@@ -207,6 +203,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 	}
 	if !exists {
 		fmt.Printf("Namespace %q no longer exists, skipping\n", name)
+		// TODO: Do we need to remove it from indexing?
 		return nil
 	}
 	ns := obj.(*unstructured.Unstructured)
@@ -234,6 +231,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 		// Referenced class doesn't exist (yet, or was deleted). Depending on
 		// your policy this might warrant an event/condition on the namespace;
 		// returning an error here would cause a retry with backoff instead.
+		// TODO: Shift this into warning, not just printf. 
 		fmt.Printf("  references NamespaceClass %q, which was not found\n", className)
 		return nil
 	}
@@ -244,6 +242,18 @@ func (c *Controller) reconcileNamespace(name string) error {
 	// NamespaceClass spec onto the namespace (labels, annotations, quotas,
 	// network policies) via c.dynamicClient.Resource(namespaceGVR).Update(...)
 	// or Patch(...).
+
+	// TODO: all reconcile logic. 
+
+	// Check some 'last class' label. 
+	// 
+	// If it's a different class than the current one, 
+	// remove any objects from the old class and apply the new class. 
+	// Update the 'last class' label to the current class. 
+	// 
+	// If it's the same class, do nothing.
+	//
+	// If it's empty or does not exist, apply the current class and set the 'last class' label to the current class.
 
 	return nil
 }
@@ -267,11 +277,23 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 	if err != nil {
 		return err
 	}
+
+	// TODO: A "re-enqueue" here isn't going to provide any information on what changed in the NSC.
+	// It's good that we're finding out which namespaces need to be updated, but their reconcile needs work.
 	fmt.Printf("  %d namespace(s) reference this class, re-enqueuing them\n", len(affected))
 	for _, obj := range affected {
 		ns := obj.(*unstructured.Unstructured)
 		c.queue.Add(queueKey{kind: "Namespace", name: ns.GetName()})
 	}
+
+	// TODO: MAJOR problem: 
+	// We must ONLY delete resources that were created by previous application of the NSC.
+	// If the NSC spec changes, we must figure out what changed and only delete resources that were created by the previous spec.
+	// We cannot delete resources that were created by other means (e.g. manually, or by another controller).
+	// This is a non-trivial problem and requires careful design. Data loss risk is huge. 
+	// Potential solution: lastSpec in NSC that contains all objects. 
+	// Create it when NSC is created. Update it whenever NSC changes. Do a diff between them to find what resources 
+	// should be created and deleted on all namespaces that reference the NSC.
 
 	return nil
 }
@@ -300,6 +322,7 @@ func main() {
 	}
 }
 
+// TODO: Not really sure what these do, revisit. 
 var _ = apierrors.IsConflict
 var _ = context.Background
 var _ = metav1.ListOptions{}

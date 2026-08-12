@@ -1,9 +1,9 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: namespaceclasses.myk8s.io
+  name: namespaceclasses.akuity.io
 spec:
-  group: myk8s.io
+  group: akuity.io
   versions:
     - name: v1
       served: true

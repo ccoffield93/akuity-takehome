@@ -38,9 +38,9 @@ Reconciling namespace: kube-system
   kubernetes.io/metadata.name=kube-system
   kubernetes.io/metadata.name=kube-node-lease
 
-  This also merits a commit, but following that, I want to go through the code and make sure that I understand the decisions behind it, and add TODOs for sections that need expansion. 
+This also merits a commit, but following that, I want to go through the code and make sure that I understand the decisions behind it, and add TODOs for sections that need expansion. 
 
-  The first thing to note when looking at the assignment specification and our current code is that the controller must actually monitor two types of resources: we want to take action when Namespaces change, but we also want to act when NamespaceClasses change. So, we will need to upgrade the controller to have two separate reconcile loops, one for each resource type, and we will need informers for each. Another prompt gets our boilerplate setup for "watch these resource types", which should put us in a better position to start cleaning up/expanding on the base generated code. I also created a simple NSC sample yaml to apply to the cluster so that there was NamespaceClass for the controller to pick up and monitor/reconcile. 
+The first thing to note when looking at the assignment specification and our current code is that the controller must actually monitor two types of resources: we want to take action when Namespaces change, but we also want to act when NamespaceClasses change. So, we will need to upgrade the controller to have two separate reconcile loops, one for each resource type, and we will need informers for each. Another prompt gets our boilerplate setup for "watch these resource types", which should put us in a better position to start cleaning up/expanding on the base generated code. I also created a simple NSC sample yaml to apply to the cluster so that there was NamespaceClass for the controller to pick up and monitor/reconcile. 
 It is important to note that Claude provided the following insights for its generated code, meaning it went further than simply creating a second Reconcile/informer:
 Relationship model. I assumed Namespaces opt into a class via a label (namespaceclass.example.com/name: my-class), since you didn't specify the linking mechanism — let me know if it's actually a field on a namespace annotation or something else and I'll adjust.
 One shared queue, tagged keys. Both informers feed the same workqueue, with each entry tagged {kind, name} so processNextItem dispatches to reconcileNamespace or reconcileNamespaceClass. This keeps a single worker pool instead of duplicating the loop.
@@ -49,3 +49,5 @@ Reads come from the informer cache, not the API server. Both reconcileNamespace 
 
 This is the point where I am jumping in to start tweaking, commenting, and making TODOs, since the basic framework (controller that monitors two types of resources for changes) has now been established. 
 
+After reading through the current controller code and getting an understanding of the flow, I have created some TODO comments in the controller outlining what needs to be done in both of the reconcile loops. Now I need to consider how to go about storing past application of a class, switching between classes, etc. 
+First, this will require improvements to the CRD itself, so that it contains the fields needed for applying what must be applied in the namespace. 
