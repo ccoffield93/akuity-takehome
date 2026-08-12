@@ -21,4 +21,21 @@ Controller started, watching namespaces...
   kubernetes.io/metadata.name=dummy-ns
   namespaceclass.akuity.io/name=test-nsc
 
-However, this approach is too simple, and lacks the Reconcile functionality needed for handling edits in the cluster. I committed here, but changes are necessary.
+However, this approach is too simple, and lacks the Reconcile functionality needed for handling edits in the cluster. I committed here, but changes are necessary to get this simple controller into a more standard Reconcile format, which is more of the standard for Kubernetes controllers. 
+
+An extension to my previous prompt 'upgraded' the controller code to use a standard reconcile loop. It has been tested as well, with virtually identical behavior but a more standard 'reconcile' function, which is familiar to me because of my past work on the Dell CSM Operator. 
+
+Controller synced, starting workers...
+Reconciling namespace: default
+  kubernetes.io/metadata.name=default
+Reconciling namespace: dummy-ns
+  kubernetes.io/metadata.name=dummy-ns
+  namespaceclass.akuity.io/name=test-nsc
+Reconciling namespace: kube-node-lease
+Reconciling namespace: kube-public
+  kubernetes.io/metadata.name=kube-public
+Reconciling namespace: kube-system
+  kubernetes.io/metadata.name=kube-system
+  kubernetes.io/metadata.name=kube-node-lease
+
+  This also merits a commit, but following that, I want to go through the code and make sure that I understand the decisions behind it, and add TODOs for sections that need expansion. 
