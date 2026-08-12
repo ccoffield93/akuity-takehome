@@ -1,0 +1,6 @@
+This document is to keep a record of the design approach taken when designing this controller/CRD. I will aim to include a small blurb for every commit pushed to the repository. 
+
+Initial commit included only the ASSIGNMENT.md that was provided as a guideline for the coding challenge. 
+
+Next step was to create a baseline custom resource definition for the NamespaceClass. I used the following blog to come up with a simple CRD, modifying the base example to : https://medium.com/@disha.20.10/building-and-extending-kubernetes-a-writing-first-custom-controller-with-go-bc57a50d61f7 . At this stage, the CRD does not meet the criteria needed for the assignment, and serves as a base to build on and add fields. 
+
