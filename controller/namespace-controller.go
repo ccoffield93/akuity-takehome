@@ -259,7 +259,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 		klog.Infof("  no last-applied class label found, applying current class and setting last-applied label")
 
 		// apply current class to namespace (e.g., create/update resources based on class spec)
-		err := applyDiffToNamespace(name, resourcesFromUnstructured(class), nil)
+		err := c.applyDiffToNamespace(name, resourcesFromUnstructured(class), nil)
 		if err != nil {
 			return fmt.Errorf("error applying current class %q to namespace %q: %v", className, name, err)
 		}
@@ -293,7 +293,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 			add, remove := diffNamespaceClassSpecs(resourcesFromUnstructured(lastClass), resourcesFromUnstructured(class))
 			klog.V(2).Infof("  resources to add: %v", add)
 			klog.V(2).Infof("  resources to remove: %v", remove)
-			err := applyDiffToNamespace(name, add, remove)
+			err := c.applyDiffToNamespace(name, add, remove)
 
 			// update the namespace with the last-applied class label
 			labels[lastNamespaceClassLabel] = className
@@ -329,8 +329,6 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 		return err
 	}
 
-	// TODO: A "re-enqueue" here isn't going to provide any information on what changed in the NSC.
-	// It's good that we're finding out which namespaces need to be updated, but their reconcile needs work.
 	klog.V(1).Infof("  %d namespace(s) reference this class", len(affected))
 
 	// We must ONLY delete resources that were created by previous application of the NSC.
@@ -346,7 +344,7 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 		newResources := resourcesFromUnstructured(class)
 		for _, nsObj := range affected {
 			ns := nsObj.(*unstructured.Unstructured)
-			err := applyDiffToNamespace(ns.GetName(), newResources, nil)
+			err := c.applyDiffToNamespace(ns.GetName(), newResources, nil)
 			if err != nil {
 				// Don't return, we want to continue processing other namespaces even if one fails.
 				klog.Errorf("  error applying new resources to namespace %q: %v", ns.GetName(), err)
@@ -374,7 +372,7 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 
 		for _, nsObj := range affected {
 			ns := nsObj.(*unstructured.Unstructured)
-			err := applyDiffToNamespace(ns.GetName(), add, remove)
+			err := c.applyDiffToNamespace(ns.GetName(), add, remove)
 			if err != nil {
 				// Don't return, we want to continue processing other namespaces even if one fails.
 				// TODO: Some kind of requeue or retry mechanism might be useful here, but for now just log the error and continue.
@@ -497,22 +495,173 @@ func prevResourcesFromUnstructured(u *unstructured.Unstructured) []map[string]in
 	return out
 }
 
-func applyDiffToNamespace(ns string, add []map[string]interface{}, remove []map[string]interface{}) error {
-	// TODO: Create/update resources in `add` and delete resources in `remove` within the given namespace `ns`.
-	// For now, just print what would be done.
-	if len(add) > 0 {
-		klog.V(2).Infof("  would add %d resource(s) to namespace %q:", len(add), ns)
-		for _, item := range add {
-			klog.V(2).Infof("    + %v", item)
+func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{}, remove []map[string]interface{}) error {
+	var firstErr error
+
+	// Helper to map a simple type string to a GVR, apiVersion and kind
+	// TODO: If we decide to support more resource types, support would go here.
+	mapType := func(t string) (schema.GroupVersionResource, string, string, bool) {
+		switch t {
+		case "ServiceAccount":
+			return schema.GroupVersionResource{Group: "", Version: "v1", Resource: "serviceaccounts"}, "v1", "ServiceAccount", true
+		case "ConfigMap":
+			return schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}, "v1", "ConfigMap", true
+		case "NetworkPolicy":
+			return schema.GroupVersionResource{Group: "networking.k8s.io", Version: "v1", Resource: "networkpolicies"}, "networking.k8s.io/v1", "NetworkPolicy", true
+		default:
+			return schema.GroupVersionResource{}, "", "", false
 		}
 	}
-	if len(remove) > 0 {
-		klog.V(2).Infof("  would remove %d resource(s) from namespace %q:", len(remove), ns)
-		for _, item := range remove {
-			klog.V(2).Infof("    - %v", item)
+
+	// Create or update items in `add`.
+	for _, item := range add {
+		traw, okT := item["type"]
+		nraw, okN := item["name"]
+		if !okT || !okN {
+			klog.Warningf("skipping malformed resource entry (missing type or name): %v", item)
+			continue
+		}
+		t := fmt.Sprintf("%v", traw)
+		name := fmt.Sprintf("%v", nraw)
+		gvr, apiVersion, kind, ok := mapType(t)
+		if !ok {
+			klog.Warningf("unsupported resource type %q, skipping", t)
+			continue
+		}
+
+		obj := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": apiVersion,
+			"kind":       kind,
+			"metadata": map[string]interface{}{
+				"name":      name,
+				"namespace": ns,
+			},
+		}}
+		// minimal required fields for certain kinds
+		if t == "ConfigMap" {
+			obj.Object["data"] = map[string]interface{}{}
+		} else if t == "NetworkPolicy" {
+			obj.Object["spec"] = map[string]interface{}{"podSelector": map[string]interface{}{}}
+		}
+
+		resIf := c.dynamicClient.Resource(gvr).Namespace(ns)
+
+		// Use a short timeout per API call to avoid hangs if the API server
+		// or a webhook becomes unresponsive.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		existing, err := resIf.Get(ctx, name, metav1.GetOptions{})
+		cancel()
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				klog.V(1).Infof("creating %s %s/%s", t, ns, name)
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				if _, err := resIf.Create(ctx, obj, metav1.CreateOptions{}); err != nil {
+					klog.Errorf("error creating %s %s/%s: %v", t, ns, name, err)
+					if firstErr == nil {
+						firstErr = err
+					}
+				}
+				cancel()
+				continue
+			}
+			klog.Errorf("error fetching existing %s %s/%s: %v", t, ns, name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		// Merge desired fields into the existing object to avoid accidentally
+		// dropping server-populated fields. Then attempt an update and retry
+		// once on conflict.
+		if t == "ConfigMap" {
+			if data, ok := obj.Object["data"]; ok {
+				existing.Object["data"] = data
+			}
+		} else if t == "NetworkPolicy" {
+			if spec, ok := obj.Object["spec"]; ok {
+				existing.Object["spec"] = spec
+			}
+		}
+
+		klog.V(1).Infof("updating %s %s/%s", t, ns, name)
+		// Try an update with retry on conflict.
+		updateErr := func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_, err := resIf.Update(ctx, existing, metav1.UpdateOptions{})
+			return err
+		}()
+		if updateErr != nil {
+			if apierrors.IsConflict(updateErr) {
+				// Refresh and retry once.
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				fresh, err := resIf.Get(ctx, name, metav1.GetOptions{})
+				cancel()
+				if err != nil {
+					klog.Errorf("error re-getting %s %s/%s after conflict: %v", t, ns, name, err)
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+				// re-apply desired fields
+				if t == "ConfigMap" {
+					if data, ok := obj.Object["data"]; ok {
+						fresh.Object["data"] = data
+					}
+				} else if t == "NetworkPolicy" {
+					if spec, ok := obj.Object["spec"]; ok {
+						fresh.Object["spec"] = spec
+					}
+				}
+				ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+				if _, err := resIf.Update(ctx, fresh, metav1.UpdateOptions{}); err != nil {
+					klog.Errorf("error updating %s %s/%s after retry: %v", t, ns, name, err)
+					if firstErr == nil {
+						firstErr = err
+					}
+				}
+				cancel()
+			} else {
+				klog.Errorf("error updating %s %s/%s: %v", t, ns, name, updateErr)
+				if firstErr == nil {
+					firstErr = updateErr
+				}
+			}
 		}
 	}
-	return nil
+
+	// Delete items in `remove`.
+	for _, item := range remove {
+		traw, okT := item["type"]
+		nraw, okN := item["name"]
+		if !okT || !okN {
+			klog.Warningf("skipping malformed resource entry (missing type or name): %v", item)
+			continue
+		}
+		t := fmt.Sprintf("%v", traw)
+		name := fmt.Sprintf("%v", nraw)
+		gvr, _, _, ok := mapType(t)
+		if !ok {
+			klog.Warningf("unsupported resource type %q for deletion, skipping", t)
+			continue
+		}
+
+		klog.V(1).Infof("deleting %s %s/%s", t, ns, name)
+		if err := c.dynamicClient.Resource(gvr).Namespace(ns).Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
+			if apierrors.IsNotFound(err) {
+				klog.V(2).Infof("resource %s %s/%s already absent", t, ns, name)
+				continue
+			}
+			klog.Errorf("error deleting %s %s/%s: %v", t, ns, name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	return firstErr
 }
 
 func main() {

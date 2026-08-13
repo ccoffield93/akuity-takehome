@@ -12,18 +12,18 @@ set -euo pipefail
 steps=(
   "Installing the CRD... |kubectl apply -f crd/namespaceclass-crd.yaml"
   "Applying namespace 1... |kubectl apply -f test/ns-1.yaml"
-  "Getting all resources in namespace 1... |kubectl get all -n demo-namespace-1"
+  "Getting all resources in namespace 1... |kubectl get networkpolicy -n demo-namespace-1 && kubectl get configmap -n demo-namespace-1 && kubectl get serviceaccount -n demo-namespace-1"
   "Applying namespace class 1... |kubectl apply -f test/nsc-1.yaml"
-  "Getting all resources in namespace 1 after applying namespace class 1... |kubectl get all -n demo-namespace-1"
+  "Getting all resources in namespace 1 after applying namespace class 1... |kubectl get networkpolicy -n demo-namespace-1 && kubectl get configmap -n demo-namespace-1 && kubectl get serviceaccount -n demo-namespace-1"
   "Applying namespace class 2... |kubectl apply -f test/nsc-2.yaml"
   "Applying namespace 2, post namespace class 2... |kubectl apply -f test/ns-2.yaml"
-  "Getting all resources in namespace 2... |kubectl get all -n demo-namespace-2"
+  "Getting all resources in namespace 2... |kubectl get networkpolicy -n demo-namespace-2 && kubectl get configmap -n demo-namespace-2 && kubectl get serviceaccount -n demo-namespace-2"
   "Deleting an item from namespace class 1... |kubectl apply -f test/nsc-1-delete.yaml"
-  "Getting all resources in namespace 1 after deleting something from namespace class 1... |kubectl get all -n demo-namespace-1"
+  "Getting all resources in namespace 1 after deleting something from namespace class 1... |kubectl get networkpolicy -n demo-namespace-1 && kubectl get configmap -n demo-namespace-1 && kubectl get serviceaccount -n demo-namespace-1"
   "Adding items to namespace class 1... |kubectl apply -f test/nsc-1-add.yaml"
-  "Getting all resources in namespace 1 after adding items to namespace class 1... |kubectl get all -n demo-namespace-1"
+  "Getting all resources in namespace 1 after adding items to namespace class 1... |kubectl get networkpolicy -n demo-namespace-1 && kubectl get configmap -n demo-namespace-1 && kubectl get serviceaccount -n demo-namespace-1"
   "Switching namespace 1 to namespace class 2... |kubectl apply -f test/ns-1-switchclass.yaml"
-  "Getting all resources in namespace 1 after switching to namespace class 2... |kub
+  "Getting all resources in namespace 1 after switching to namespace class 2... | kubectl get networkpolicy -n demo-namespace-1 && kubectl get configmap -n demo-namespace-1 && kubectl get serviceaccount -n demo-namespace-1"
   "Cleaning up... |bash test/cleanup.sh"
 )
 
