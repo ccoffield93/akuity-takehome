@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 )
 
 // This controller assumes NamespaceClass is a CRD like:
@@ -53,6 +54,16 @@ var namespaceClassGVR = schema.GroupVersionResource{
 // This is the label that should be checked on namespaces to assign a NSC.
 const namespaceClassLabel = "namespaceclass.akuity.io/name"
 const lastNamespaceClassLabel = "namespaceclass.akuity.io/last-applied-name"
+
+// Log verbosity used for klog.V(<n>) checks. Increase for more verbose output.
+// Common guidance:
+//   - 0: Production/info — only important Info/Warning/Error and minimal V(0) messages.
+//   - 1: Debug (default) — lightweight debug messages useful during normal troubleshooting.
+//   - 2: Verbose/trace — more detailed internal state useful for deeper debugging.
+//   - 3+: Very verbose — per-item loops, full object dumps; extremely noisy.
+//
+// To change at runtime use the `-v` flag (klog supports `-v=<n>`), e.g. `./controller -v=2`.
+const logVerbosity = 1
 
 // queueKey tags each workqueue entry with which resource it refers to, so a
 // single shared queue/worker pool can drive reconciliation for both types.
@@ -141,14 +152,14 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	fmt.Println("Controller synced, starting workers...")
+	klog.Info("Controller synced, starting workers...")
 
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
 
 	<-stopCh
-	fmt.Println("Shutting down controller")
+	klog.Info("Shutting down controller")
 	return nil
 }
 
@@ -182,13 +193,13 @@ func (c *Controller) processNextItem() bool {
 	}
 
 	if c.queue.NumRequeues(item) < 5 {
-		fmt.Printf("Error reconciling %s %q, retrying: %v\n", key.kind, key.name, err)
+		klog.Warningf("Error reconciling %s %q, retrying: %v", key.kind, key.name, err)
 		c.queue.AddRateLimited(item)
 		return true
 	}
 
 	runtime.HandleError(err)
-	fmt.Printf("Dropping %s %q out of the queue after too many retries: %v\n", key.kind, key.name, err)
+	klog.Errorf("Dropping %s %q out of the queue after too many retries: %v", key.kind, key.name, err)
 	c.queue.Forget(item)
 	return true
 }
@@ -202,24 +213,24 @@ func (c *Controller) reconcileNamespace(name string) error {
 		return err
 	}
 	if !exists {
-		fmt.Printf("Namespace %q no longer exists, skipping\n", name)
+		klog.Infof("Namespace %q no longer exists, skipping", name)
 		// TODO: Do we need to remove it from indexing?
 		return nil
 	}
 	ns := obj.(*unstructured.Unstructured)
 
-	fmt.Printf("Reconciling Namespace: %s\n", ns.GetName())
+	klog.Infof("Reconciling Namespace: %s", ns.GetName())
 	labels := ns.GetLabels()
 	if len(labels) == 0 {
-		fmt.Println("  (no labels)")
+		klog.V(logVerbosity).Info("  (no labels)")
 	}
 	for k, v := range labels {
-		fmt.Printf("  %s=%s\n", k, v)
+		klog.V(logVerbosity).Infof("  %s=%s", k, v)
 	}
 
 	className, ok := labels[namespaceClassLabel]
 	if !ok || className == "" {
-		fmt.Println("  no NamespaceClass reference")
+		klog.V(logVerbosity).Info("  no NamespaceClass reference")
 		return nil
 	}
 
@@ -232,11 +243,11 @@ func (c *Controller) reconcileNamespace(name string) error {
 		// your policy this might warrant an event/condition on the namespace;
 		// returning an error here would cause a retry with backoff instead.
 		// TODO: Shift this into warning, not just printf.
-		fmt.Printf("  references NamespaceClass %q, which was not found\n", className)
+		klog.Warningf("  references NamespaceClass %q, which was not found", className)
 		return nil
 	}
 	class := classObj.(*unstructured.Unstructured)
-	fmt.Printf("  belongs to NamespaceClass %q (spec: %v)\n", class.GetName(), class.Object["spec"])
+	klog.V(logVerbosity).Infof("  belongs to NamespaceClass %q (spec: %v)", class.GetName(), class.Object["spec"])
 
 	// Reconcile logic below.
 
@@ -244,7 +255,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 	lastClassName, found := labels[lastNamespaceClassLabel]
 	if !found {
 		// there was no last class label, so we should apply the current class and set the last-applied label
-		fmt.Println("  no last-applied class label found, applying current class and setting last-applied label")
+		klog.Infof("  no last-applied class label found, applying current class and setting last-applied label")
 
 		// apply current class to namespace (e.g., create/update resources based on class spec)
 		err := applyDiffToNamespace(name, resourcesFromUnstructured(class), nil)
@@ -259,7 +270,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 			return fmt.Errorf("error updating namespace %q with last-applied class label: %v", name, err)
 		}
 	} else if lastClassName != className {
-		fmt.Printf("  last-applied class label %q differs from current class %q, updating resources and applying new class\n", lastClassName, className)
+		klog.Infof("  last-applied class label %q differs from current class %q, updating resources and applying new class", lastClassName, className)
 		// get last class object by name from server
 		// TODO: Can we use our indexer to get this faster/easier?
 		lastClassObj, err := c.dynamicClient.Resource(namespaceClassGVR).Get(context.TODO(), lastClassName, metav1.GetOptions{})
@@ -267,7 +278,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 			if apierrors.IsNotFound(err) {
 				// if we can't find the last class, we can't remove any resources from it, but we can still apply the new class
 				// so don't return, just log a message and continue
-				fmt.Printf("  previous NamespaceClass %q not found on server, nothing to clean up\n", lastClassName)
+				klog.Warningf("  previous NamespaceClass %q not found on server, nothing to clean up", lastClassName)
 			} else {
 				return fmt.Errorf("error retrieving previous NamespaceClass %q: %v", lastClassName, err)
 			}
@@ -276,11 +287,11 @@ func (c *Controller) reconcileNamespace(name string) error {
 			// but we do know its format from the CRD.
 			// TODO: Update here if we decide to make a typed client.
 			lastClass := lastClassObj
-			fmt.Printf("  previous NamespaceClass %q (spec: %v) retrieved from server\n", lastClass.GetName(), lastClass.Object["spec"])
+			klog.V(logVerbosity).Infof("  previous NamespaceClass %q (spec: %v) retrieved from server", lastClass.GetName(), lastClass.Object["spec"])
 
 			add, remove := diffNamespaceClassSpecs(resourcesFromUnstructured(lastClass), resourcesFromUnstructured(class))
-			fmt.Printf("  resources to add: %v\n", add)
-			fmt.Printf("  resources to remove: %v\n", remove)
+			klog.V(logVerbosity).Infof("  resources to add: %v", add)
+			klog.V(logVerbosity).Infof("  resources to remove: %v", remove)
 			err := applyDiffToNamespace(name, add, remove)
 
 			// update the namespace with the last-applied class label
@@ -292,7 +303,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 			}
 		}
 	} else {
-		fmt.Println("  last-applied class label matches current class, no action needed")
+		klog.V(logVerbosity).Info("  last-applied class label matches current class, no action needed")
 	}
 	return nil
 }
@@ -306,11 +317,11 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 		return err
 	}
 	if !exists {
-		fmt.Printf("NamespaceClass %q no longer exists, skipping\n", name)
+		klog.Infof("NamespaceClass %q no longer exists, skipping", name)
 		return nil
 	}
 	class := obj.(*unstructured.Unstructured)
-	fmt.Printf("Reconciling NamespaceClass: %s (spec: %v)\n", class.GetName(), class.Object["spec"])
+	klog.Infof("Reconciling NamespaceClass: %s (spec: %v)", class.GetName(), class.Object["spec"])
 
 	affected, err := c.nsClassIndexer.ByIndex(byNamespaceClassIndex, name)
 	if err != nil {
@@ -319,7 +330,7 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 
 	// TODO: A "re-enqueue" here isn't going to provide any information on what changed in the NSC.
 	// It's good that we're finding out which namespaces need to be updated, but their reconcile needs work.
-	fmt.Printf("  %d namespace(s) reference this class, re-enqueuing them\n", len(affected))
+	klog.V(logVerbosity).Infof("  %d namespace(s) reference this class, re-enqueuing them", len(affected))
 	for _, obj := range affected {
 		ns := obj.(*unstructured.Unstructured)
 		c.queue.Add(queueKey{kind: "Namespace", name: ns.GetName()})
@@ -413,21 +424,23 @@ func applyDiffToNamespace(ns string, add []map[string]interface{}, remove []map[
 	// TODO: Create/update resources in `add` and delete resources in `remove` within the given namespace `ns`.
 	// For now, just print what would be done.
 	if len(add) > 0 {
-		fmt.Printf("  would add %d resource(s) to namespace %q:\n", len(add), ns)
+		klog.V(logVerbosity).Infof("  would add %d resource(s) to namespace %q:", len(add), ns)
 		for _, item := range add {
-			fmt.Printf("    + %v\n", item)
+			klog.V(logVerbosity).Infof("    + %v", item)
 		}
 	}
 	if len(remove) > 0 {
-		fmt.Printf("  would remove %d resource(s) from namespace %q:\n", len(remove), ns)
+		klog.V(logVerbosity).Infof("  would remove %d resource(s) from namespace %q:", len(remove), ns)
 		for _, item := range remove {
-			fmt.Printf("    - %v\n", item)
+			klog.V(logVerbosity).Infof("    - %v", item)
 		}
 	}
 	return nil
 }
 
 func main() {
+	klog.InitFlags(nil)
+	defer klog.Flush()
 	kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {

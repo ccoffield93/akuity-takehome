@@ -62,3 +62,5 @@ Next, I focused on the Namespace reconciler, which is centered around the 'last 
 Cursory testing for this seemed to behave roughly as expected. I added helper methods to do things like get the difference between sets of NSC values, as well as a stub for applying this diff. 
 
 As a vanity item, at this point I added a README that shows when the repository is loaded in GitHub. I had it generated quickly using the in-built Copilot in VSCode, read over it, tweaked a few things to be clearer, and committed it as-is for now. 
+
+Another vanity item. I switched fmt.Print calls to use a proper logging system that can be made more or less verbose as needed, which makes debugging simpler. 
