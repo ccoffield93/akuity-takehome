@@ -1,11 +1,10 @@
 apiVersion: akuity.io/v1
 kind: NamespaceClass
 metadata:
-  name: demo-namespaceclass
+  name: demo-namespaceclass-2
 spec:
   resources:
     - type: "NetworkPolicy"
-      name: "demo-networkpolicy"
-  lastResources:
+      name: "demo-networkpolicy2"
     - type: "ServiceAccount"
-      name: "demo-serviceaccount"
+      name: "demo-serviceaccount2"

@@ -15,9 +15,31 @@ spec:
             spec:
               type: object
               properties:
-                message:
-                  type: string
-  scope: Namespaced
+                resources:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                      - type
+                      - name
+                lastResources:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                      - type
+                      - name
+  scope: Cluster
   names:
     plural: namespaceclasses
     singular: namespaceclass

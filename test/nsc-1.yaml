@@ -6,6 +6,5 @@ spec:
   resources:
     - type: "NetworkPolicy"
       name: "demo-networkpolicy"
-  lastResources:
     - type: "ServiceAccount"
       name: "demo-serviceaccount"

@@ -51,3 +51,5 @@ This is the point where I am jumping in to start tweaking, commenting, and makin
 
 After reading through the current controller code and getting an understanding of the flow, I have created some TODO comments in the controller outlining what needs to be done in both of the reconcile loops. Now I need to consider how to go about storing past application of a class, switching between classes, etc. 
 First, this will require improvements to the CRD itself, so that it contains the fields needed for applying what must be applied in the namespace. 
+
+I added an array of name/type fields to the CRD, so any arbitrary number of objects can be assigned to a NSC. Then I set about creating a test suite to automate running through the integration tests and seeing the changes take effect in a live cluster. When I write a README for the test set, I will add details on the test cases and what they're doing.
