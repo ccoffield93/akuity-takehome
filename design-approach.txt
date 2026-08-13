@@ -4,7 +4,7 @@ All development is performed on an OpenSUSE WSL installation, using minikube to 
 
 Initial commit included only the ASSIGNMENT.md that was provided as a guideline for the coding challenge. 
 
-Next step was to create a baseline custom resource definition for the NamespaceClass. I used the following blog to come up with a simple CRD, modifying the base example to : https://medium.com/@disha.20.10/building-and-extending-kubernetes-a-writing-first-custom-controller-with-go-bc57a50d61f7 . At this stage, the CRD does not meet the criteria needed for the assignment, and serves as a base to build on and add fields. 
+Next step was to create a baseline custom resource definition for the NamespaceClass. I used the following blog to come up with a simple CRD, modifying the base example: https://medium.com/@disha.20.10/building-and-extending-kubernetes-a-writing-first-custom-controller-with-go-bc57a50d61f7 . At this stage, the CRD does not meet the criteria needed for the assignment, and serves as a base to build on and add fields. 
 
 Following this, I had Claude generate a basic controller that monitors namespaces, printing their labels any time they're modified. This follows what I believe to be a healthy use of AI tooling: boilerplate code that gets the hooks in the right places but doesn't immediately surge past understanding of the problem/solution.
 Running this controller locally, I validated that it retrieves all namespaces, detects when new ones are added, and successfully accesses their labels:
@@ -64,3 +64,6 @@ Cursory testing for this seemed to behave roughly as expected. I added helper me
 As a vanity item, at this point I added a README that shows when the repository is loaded in GitHub. I had it generated quickly using the in-built Copilot in VSCode, read over it, tweaked a few things to be clearer, and committed it as-is for now. 
 
 Another vanity item. I switched fmt.Print calls to use a proper logging system that can be made more or less verbose as needed, which makes debugging simpler. 
+
+Next, I implemented the reconciler for the NamespaceClass. It follows very similar logic: if there's some 'last' set of objects that differ from the current state, update ALL namespaces using this NSC with the diff. At this stage, we still aren't really creating or applying resources, just getting a good handle of what SHOULD be created or applied. This has not been thoroughly tested, but the logic is sound and I've done a couple of modifications with the controller running to ensure they're picked up.
+I also revamped the logging system so that it is more controlled on verbosity.

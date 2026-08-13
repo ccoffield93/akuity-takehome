@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -222,15 +223,15 @@ func (c *Controller) reconcileNamespace(name string) error {
 	klog.Infof("Reconciling Namespace: %s", ns.GetName())
 	labels := ns.GetLabels()
 	if len(labels) == 0 {
-		klog.V(logVerbosity).Info("  (no labels)")
+		klog.V(2).Info("  (no labels)")
 	}
 	for k, v := range labels {
-		klog.V(logVerbosity).Infof("  %s=%s", k, v)
+		klog.V(2).Infof("  %s=%s", k, v)
 	}
 
 	className, ok := labels[namespaceClassLabel]
 	if !ok || className == "" {
-		klog.V(logVerbosity).Info("  no NamespaceClass reference")
+		klog.V(1).Info("  no NamespaceClass reference")
 		return nil
 	}
 
@@ -247,7 +248,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 		return nil
 	}
 	class := classObj.(*unstructured.Unstructured)
-	klog.V(logVerbosity).Infof("  belongs to NamespaceClass %q (spec: %v)", class.GetName(), class.Object["spec"])
+	klog.V(1).Infof("  belongs to NamespaceClass %q (spec: %v)", class.GetName(), class.Object["spec"])
 
 	// Reconcile logic below.
 
@@ -287,11 +288,11 @@ func (c *Controller) reconcileNamespace(name string) error {
 			// but we do know its format from the CRD.
 			// TODO: Update here if we decide to make a typed client.
 			lastClass := lastClassObj
-			klog.V(logVerbosity).Infof("  previous NamespaceClass %q (spec: %v) retrieved from server", lastClass.GetName(), lastClass.Object["spec"])
+			klog.V(2).Infof("  previous NamespaceClass %q (spec: %v) retrieved from server", lastClass.GetName(), lastClass.Object["spec"])
 
 			add, remove := diffNamespaceClassSpecs(resourcesFromUnstructured(lastClass), resourcesFromUnstructured(class))
-			klog.V(logVerbosity).Infof("  resources to add: %v", add)
-			klog.V(logVerbosity).Infof("  resources to remove: %v", remove)
+			klog.V(2).Infof("  resources to add: %v", add)
+			klog.V(2).Infof("  resources to remove: %v", remove)
 			err := applyDiffToNamespace(name, add, remove)
 
 			// update the namespace with the last-applied class label
@@ -303,7 +304,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 			}
 		}
 	} else {
-		klog.V(logVerbosity).Info("  last-applied class label matches current class, no action needed")
+		klog.V(1).Info("  last-applied class label matches current class, no action needed")
 	}
 	return nil
 }
@@ -321,8 +322,8 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 		return nil
 	}
 	class := obj.(*unstructured.Unstructured)
-	klog.Infof("Reconciling NamespaceClass: %s (spec: %v)", class.GetName(), class.Object["spec"])
-
+	klog.Infof("Reconciling NamespaceClass: %s )", class.GetName())
+	klog.V(2).Infof("  spec: %v", class.Object["spec"])
 	affected, err := c.nsClassIndexer.ByIndex(byNamespaceClassIndex, name)
 	if err != nil {
 		return err
@@ -330,20 +331,69 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 
 	// TODO: A "re-enqueue" here isn't going to provide any information on what changed in the NSC.
 	// It's good that we're finding out which namespaces need to be updated, but their reconcile needs work.
-	klog.V(logVerbosity).Infof("  %d namespace(s) reference this class, re-enqueuing them", len(affected))
-	for _, obj := range affected {
-		ns := obj.(*unstructured.Unstructured)
-		c.queue.Add(queueKey{kind: "Namespace", name: ns.GetName()})
-	}
+	klog.V(1).Infof("  %d namespace(s) reference this class", len(affected))
 
-	// TODO: MAJOR problem:
 	// We must ONLY delete resources that were created by previous application of the NSC.
 	// If the NSC spec changes, we must figure out what changed and only delete resources that were created by the previous spec.
 	// We cannot delete resources that were created by other means (e.g. manually, or by another controller).
-	// This is a non-trivial problem and requires careful design. Data loss risk is huge.
-	// Potential solution: lastSpec in NSC that contains all objects.
-	// Create it when NSC is created. Update it whenever NSC changes. Do a diff between them to find what resources
+	// To track this, we will use lastSpec in NSC that contains all objects.
+	// Create it as empty when NSC is created. Update it whenever NSC changes. Do a diff between them to find what resources
 	// should be created and deleted on all namespaces that reference the NSC.
+
+	lastResources := prevResourcesFromUnstructured(class)
+	if lastResources == nil {
+		klog.V(1).Infof("  no last-applied resources found in NamespaceClass %q, only need to apply new ones", name)
+		newResources := resourcesFromUnstructured(class)
+		for _, nsObj := range affected {
+			ns := nsObj.(*unstructured.Unstructured)
+			err := applyDiffToNamespace(ns.GetName(), newResources, nil)
+			if err != nil {
+				// Don't return, we want to continue processing other namespaces even if one fails.
+				klog.Errorf("  error applying new resources to namespace %q: %v", ns.GetName(), err)
+
+			}
+		}
+
+		// Update the lastResources in the NSC to the current resources
+		spec, ok := class.Object["spec"].(map[string]interface{})
+		if !ok || spec == nil {
+			spec = make(map[string]interface{})
+		}
+		spec["lastResources"] = newResources
+		class.Object["spec"] = spec
+		_, err = c.dynamicClient.Resource(namespaceClassGVR).Update(context.TODO(), class, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Errorf("  error updating NamespaceClass %q with last-applied resources: %v", name, err)
+		}
+	} else {
+		// There are some last-applied resources, so we need to diff them with the current resources and apply the changes to all affected namespaces.
+		newResources := resourcesFromUnstructured(class)
+		add, remove := diffNamespaceClassSpecs(lastResources, newResources)
+		klog.V(2).Infof("  resources to add: %v", add)
+		klog.V(2).Infof("  resources to remove: %v", remove)
+
+		for _, nsObj := range affected {
+			ns := nsObj.(*unstructured.Unstructured)
+			err := applyDiffToNamespace(ns.GetName(), add, remove)
+			if err != nil {
+				// Don't return, we want to continue processing other namespaces even if one fails.
+				// TODO: Some kind of requeue or retry mechanism might be useful here, but for now just log the error and continue.
+				klog.Errorf("  error applying resource changes to namespace %q: %v", ns.GetName(), err)
+			}
+		}
+
+		// Update the lastResources in the NSC to the current resources
+		spec, ok := class.Object["spec"].(map[string]interface{})
+		if !ok || spec == nil {
+			spec = make(map[string]interface{})
+		}
+		spec["lastResources"] = newResources
+		class.Object["spec"] = spec
+		_, err = c.dynamicClient.Resource(namespaceClassGVR).Update(context.TODO(), class, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Errorf("  error updating NamespaceClass %q with last-applied resources: %v", name, err)
+		}
+	}
 
 	return nil
 }
@@ -420,19 +470,46 @@ func resourcesFromUnstructured(u *unstructured.Unstructured) []map[string]interf
 	return out
 }
 
+// prevResourcesFromUnstructured extracts `spec.lastResources` from a
+// NamespaceClass unstructured object and returns it as a slice of
+// map[string]interface{}. Returns nil if the field is missing, empty, or malformed.
+func prevResourcesFromUnstructured(u *unstructured.Unstructured) []map[string]interface{} {
+	if u == nil {
+		return nil
+	}
+	spec, ok := u.Object["spec"].(map[string]interface{})
+	if !ok || spec == nil {
+		return nil
+	}
+	raw, ok := spec["lastResources"].([]interface{})
+	if !ok || raw == nil {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(raw))
+	for _, item := range raw {
+		if m, ok := item.(map[string]interface{}); ok {
+			out = append(out, m)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func applyDiffToNamespace(ns string, add []map[string]interface{}, remove []map[string]interface{}) error {
 	// TODO: Create/update resources in `add` and delete resources in `remove` within the given namespace `ns`.
 	// For now, just print what would be done.
 	if len(add) > 0 {
-		klog.V(logVerbosity).Infof("  would add %d resource(s) to namespace %q:", len(add), ns)
+		klog.V(2).Infof("  would add %d resource(s) to namespace %q:", len(add), ns)
 		for _, item := range add {
-			klog.V(logVerbosity).Infof("    + %v", item)
+			klog.V(2).Infof("    + %v", item)
 		}
 	}
 	if len(remove) > 0 {
-		klog.V(logVerbosity).Infof("  would remove %d resource(s) from namespace %q:", len(remove), ns)
+		klog.V(2).Infof("  would remove %d resource(s) from namespace %q:", len(remove), ns)
 		for _, item := range remove {
-			klog.V(logVerbosity).Infof("    - %v", item)
+			klog.V(2).Infof("    - %v", item)
 		}
 	}
 	return nil
@@ -440,6 +517,10 @@ func applyDiffToNamespace(ns string, add []map[string]interface{}, remove []map[
 
 func main() {
 	klog.InitFlags(nil)
+	// set klog verbosity from the compile-time `logVerbosity` constant so
+	// klog.V(<n>) checks behave according to our chosen default.
+	flag.Set("v", fmt.Sprintf("%d", logVerbosity))
+	flag.Parse()
 	defer klog.Flush()
 	kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
