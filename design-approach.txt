@@ -52,4 +52,11 @@ This is the point where I am jumping in to start tweaking, commenting, and makin
 After reading through the current controller code and getting an understanding of the flow, I have created some TODO comments in the controller outlining what needs to be done in both of the reconcile loops. Now I need to consider how to go about storing past application of a class, switching between classes, etc. 
 First, this will require improvements to the CRD itself, so that it contains the fields needed for applying what must be applied in the namespace. 
 
-I added an array of name/type fields to the CRD, so any arbitrary number of objects can be assigned to a NSC. Then I set about creating a test suite to automate running through the integration tests and seeing the changes take effect in a live cluster. When I write a README for the test set, I will add details on the test cases and what they're doing.
+I added an array of name/type fields to the CRD, so any arbitrary number of objects can be assigned to a NSC. Then I set about creating a test suite to automate running through the integration tests and seeing the changes take effect in a live cluster. The README for this test set has been written to describe what it does, how it functions, and what is validated by specific tests.
+
+Next, I focused on the Namespace reconciler, which is centered around the 'last class' label logic. The code in that function has comments to describe the behavior, but basically: 
+- I needed a way to know when a NSC change happened
+- I didn't want to rely on the last-applied annotation because it's kubectl-specific 
+- The solution that I landed on was for a NS to keep track of its last applied NSC (not all the contents of that NSC, just the name, we don't want to abuse labels) 
+- If current NSC differs from last known NSC, reconcile and update last known NSC 
+Cursory testing for this seemed to behave roughly as expected. I added helper methods to do things like get the difference between sets of NSC values, as well as a stub for applying this diff. 

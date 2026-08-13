@@ -35,7 +35,7 @@ import (
 //
 // Rather than generating a typed clientset for this one CRD, this uses the
 // dynamic client + dynamicinformer, which works against unstructured objects
-// for any GVR without codegen. 
+// for any GVR without codegen.
 // TODO: Consider using client-gen to generate a typed clientset for NamespaceClass, which would give compile-time type safety and avoid the need to use unstructured.Unstructured. For a small example like this, dynamic client is simpler and avoids codegen boilerplate.
 // This would allow compile-time type safety and avoid the need to use unstructured objects.
 var namespaceGVR = schema.GroupVersionResource{
@@ -231,30 +231,69 @@ func (c *Controller) reconcileNamespace(name string) error {
 		// Referenced class doesn't exist (yet, or was deleted). Depending on
 		// your policy this might warrant an event/condition on the namespace;
 		// returning an error here would cause a retry with backoff instead.
-		// TODO: Shift this into warning, not just printf. 
+		// TODO: Shift this into warning, not just printf.
 		fmt.Printf("  references NamespaceClass %q, which was not found\n", className)
 		return nil
 	}
 	class := classObj.(*unstructured.Unstructured)
 	fmt.Printf("  belongs to NamespaceClass %q (spec: %v)\n", class.GetName(), class.Object["spec"])
 
-	// Real reconciling logic would go here, e.g. applying settings from the
-	// NamespaceClass spec onto the namespace (labels, annotations, quotas,
-	// network policies) via c.dynamicClient.Resource(namespaceGVR).Update(...)
-	// or Patch(...).
+	// Reconcile logic below.
 
-	// TODO: all reconcile logic. 
+	// Check label to see if there was a previously applied class
+	lastClassName, found := labels[lastNamespaceClassLabel]
+	if !found {
+		// there was no last class label, so we should apply the current class and set the last-applied label
+		fmt.Println("  no last-applied class label found, applying current class and setting last-applied label")
 
-	// Check some 'last class' label. 
-	// 
-	// If it's a different class than the current one, 
-	// remove any objects from the old class and apply the new class. 
-	// Update the 'last class' label to the current class. 
-	// 
-	// If it's the same class, do nothing.
-	//
-	// If it's empty or does not exist, apply the current class and set the 'last class' label to the current class.
+		// apply current class to namespace (e.g., create/update resources based on class spec)
+		err := applyDiffToNamespace(name, resourcesFromUnstructured(class), nil)
+		if err != nil {
+			return fmt.Errorf("error applying current class %q to namespace %q: %v", className, name, err)
+		}
+		// Update the namespace with the last-applied class label
+		labels[lastNamespaceClassLabel] = className
+		ns.SetLabels(labels)
+		_, err = c.dynamicClient.Resource(namespaceGVR).Update(context.TODO(), ns, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("error updating namespace %q with last-applied class label: %v", name, err)
+		}
+	} else if lastClassName != className {
+		fmt.Printf("  last-applied class label %q differs from current class %q, updating resources and applying new class\n", lastClassName, className)
+		// get last class object by name from server
+		// TODO: Can we use our indexer to get this faster/easier?
+		lastClassObj, err := c.dynamicClient.Resource(namespaceClassGVR).Get(context.TODO(), lastClassName, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				// if we can't find the last class, we can't remove any resources from it, but we can still apply the new class
+				// so don't return, just log a message and continue
+				fmt.Printf("  previous NamespaceClass %q not found on server, nothing to clean up\n", lastClassName)
+			} else {
+				return fmt.Errorf("error retrieving previous NamespaceClass %q: %v", lastClassName, err)
+			}
+		} else {
+			// lastClassObj is an *unstructured.Unstructured
+			// but we do know its format from the CRD.
+			// TODO: Update here if we decide to make a typed client.
+			lastClass := lastClassObj
+			fmt.Printf("  previous NamespaceClass %q (spec: %v) retrieved from server\n", lastClass.GetName(), lastClass.Object["spec"])
 
+			add, remove := diffNamespaceClassSpecs(resourcesFromUnstructured(lastClass), resourcesFromUnstructured(class))
+			fmt.Printf("  resources to add: %v\n", add)
+			fmt.Printf("  resources to remove: %v\n", remove)
+			err := applyDiffToNamespace(name, add, remove)
+
+			// update the namespace with the last-applied class label
+			labels[lastNamespaceClassLabel] = className
+			ns.SetLabels(labels)
+			_, err = c.dynamicClient.Resource(namespaceGVR).Update(context.TODO(), ns, metav1.UpdateOptions{})
+			if err != nil {
+				return fmt.Errorf("error updating namespace %q with last-applied class label: %v", name, err)
+			}
+		}
+	} else {
+		fmt.Println("  last-applied class label matches current class, no action needed")
+	}
 	return nil
 }
 
@@ -286,15 +325,105 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 		c.queue.Add(queueKey{kind: "Namespace", name: ns.GetName()})
 	}
 
-	// TODO: MAJOR problem: 
+	// TODO: MAJOR problem:
 	// We must ONLY delete resources that were created by previous application of the NSC.
 	// If the NSC spec changes, we must figure out what changed and only delete resources that were created by the previous spec.
 	// We cannot delete resources that were created by other means (e.g. manually, or by another controller).
-	// This is a non-trivial problem and requires careful design. Data loss risk is huge. 
-	// Potential solution: lastSpec in NSC that contains all objects. 
-	// Create it when NSC is created. Update it whenever NSC changes. Do a diff between them to find what resources 
+	// This is a non-trivial problem and requires careful design. Data loss risk is huge.
+	// Potential solution: lastSpec in NSC that contains all objects.
+	// Create it when NSC is created. Update it whenever NSC changes. Do a diff between them to find what resources
 	// should be created and deleted on all namespaces that reference the NSC.
 
+	return nil
+}
+
+// diffNamespaceClassSpecs compares two NamespaceClass unstructured objects and
+// returns two slices:
+// - items present in `class` but not in `lastClass` (to add)
+// - items present in `lastClass` but not in `class` (to remove)
+// Each item is represented as a map[string]interface{} as it appears in the
+// unstructured object's `spec.resources` array.
+func diffNamespaceClassSpecs(last, cur []map[string]interface{}) (add []map[string]interface{}, remove []map[string]interface{}) {
+	// build index for last and current by a stable key (type:name)
+	makeKey := func(m map[string]interface{}) string {
+		t := ""
+		n := ""
+		if v, ok := m["type"]; ok && v != nil {
+			t = fmt.Sprintf("%v", v)
+		}
+		if v, ok := m["name"]; ok && v != nil {
+			n = fmt.Sprintf("%v", v)
+		}
+		return t + ":" + n
+	}
+
+	lastIndex := map[string]map[string]interface{}{}
+	for _, item := range last {
+		lastIndex[makeKey(item)] = item
+	}
+
+	curIndex := map[string]map[string]interface{}{}
+	for _, item := range cur {
+		curIndex[makeKey(item)] = item
+	}
+
+	// items in cur but not in last => add
+	for k, item := range curIndex {
+		if _, ok := lastIndex[k]; !ok {
+			add = append(add, item)
+		}
+	}
+
+	// items in last but not in cur => remove
+	for k, item := range lastIndex {
+		if _, ok := curIndex[k]; !ok {
+			remove = append(remove, item)
+		}
+	}
+
+	return add, remove
+}
+
+// resourcesFromUnstructured safely extracts `spec.resources` from a
+// NamespaceClass unstructured object and returns it as a slice of
+// map[string]interface{}. It tolerates missing fields and different
+// underlying types coming from the API.
+func resourcesFromUnstructured(u *unstructured.Unstructured) []map[string]interface{} {
+	if u == nil {
+		return nil
+	}
+	spec, ok := u.Object["spec"].(map[string]interface{})
+	if !ok || spec == nil {
+		return nil
+	}
+	raw, ok := spec["resources"].([]interface{})
+	if !ok || raw == nil {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(raw))
+	for _, item := range raw {
+		if m, ok := item.(map[string]interface{}); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func applyDiffToNamespace(ns string, add []map[string]interface{}, remove []map[string]interface{}) error {
+	// TODO: Create/update resources in `add` and delete resources in `remove` within the given namespace `ns`.
+	// For now, just print what would be done.
+	if len(add) > 0 {
+		fmt.Printf("  would add %d resource(s) to namespace %q:\n", len(add), ns)
+		for _, item := range add {
+			fmt.Printf("    + %v\n", item)
+		}
+	}
+	if len(remove) > 0 {
+		fmt.Printf("  would remove %d resource(s) from namespace %q:\n", len(remove), ns)
+		for _, item := range remove {
+			fmt.Printf("    - %v\n", item)
+		}
+	}
 	return nil
 }
 
@@ -322,7 +451,7 @@ func main() {
 	}
 }
 
-// TODO: Not really sure what these do, revisit. 
+// TODO: Not really sure what these do, revisit.
 var _ = apierrors.IsConflict
 var _ = context.Background
 var _ = metav1.ListOptions{}
