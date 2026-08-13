@@ -1,6 +1,6 @@
 This directory provides a simple functional test to exhibit the behavior of the NamespaceClass custom resource and its controller. 
 
-The test script follows a simple pattern of applying YAMLs, checking the contents of the appropriate namespace, and repeating. The controller, running in the background in another terminal, should create or delete resources in the namespace based on NamespaceClass contents. The test steps are as follows:
+The test script follows a simple pattern of applying YAMLs, checking the contents of the appropriate namespace, and then updating the namespace or namespace class objects on the cluster (as a user would). The controller, running in the background in another terminal, should create or delete resources in the namespace based on NamespaceClass contents. The test steps are as follows:
 
 1. Install the CRD for NamespaceClass to the cluster. 
 2. Apply namespace 1 (NS1) to the cluster, with its NamespaceClass label set to use NamespaceClass 1 (NSC1). 

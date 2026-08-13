@@ -1,9 +1,0 @@
-# Same as nsc-1.yaml, but remove one item, to test that it gets removed from linked namespaces
-apiVersion: akuity.io/v1
-kind: NamespaceClass
-metadata:
-  name: demo-namespaceclass
-spec:
-  resources:
-    - type: "NetworkPolicy"
-      name: "demo-networkpolicy"
