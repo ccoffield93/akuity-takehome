@@ -75,3 +75,12 @@ I added this functionality and started testing. The first thing that I noticed w
 The test suite has been changed to use in-place updates to the NS and NSC objects on the cluster, which means preserving the 'last state' labels so that the reconcile can retrieve their needs appropriately. 
 A full test suite run shows the program behaving as it is supposed to, with all objects created and destroyed as intended. This allowed me to clean up many of the YAML files used for testing previously, and I made some tweaks to the README for the test to clarify this approach. 
 As of this point, the test cases that were written prior to full implementation are satisfied, and the initial work on the problem is done. Next will be a review of the full controller program to ensure its design makes sense, and clean up what TODOs are possible.
+
+First pass. Made the logging follow a general schema of:
+- Important information (like adding or removing cluster resources) prints unconditionally
+- Basic debugging information (like printing how many namespaces use a NSC) print at level 1 or above
+- Advanced debugging information (like printing all fields in a retrieved object) print at level 2 or above 
+Also improved the retrieval of NSC in namespace reconcile to use the indexer and added some helpful comments. Removed some no longer needed TODOs and got a better understanding of the code from top to bottom. 
+This comes with upgrades to the README to help iron out the remaining questions, issues, and steps forward. 
+After all of my cleanup/code changes, the operator still behaves as expected and the tests still perform as I would like them to. 
+I would call the work 'complete' at this stage. Unit tests, gofmpt, govet, etc are nice-to-haves that I will attempt to add in before submission.

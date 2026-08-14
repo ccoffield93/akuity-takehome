@@ -62,8 +62,6 @@ const lastNamespaceClassLabel = "namespaceclass.akuity.io/last-applied-name"
 //   - 1: Debug (default) — lightweight debug messages useful during normal troubleshooting.
 //   - 2: Verbose/trace — more detailed internal state useful for deeper debugging.
 //   - 3+: Very verbose — per-item loops, full object dumps; extremely noisy.
-//
-// To change at runtime use the `-v` flag (klog supports `-v=<n>`), e.g. `./controller -v=2`.
 const logVerbosity = 1
 
 // queueKey tags each workqueue entry with which resource it refers to, so a
@@ -84,6 +82,7 @@ type Controller struct {
 // nsClassNameIndexer indexes Namespace objects by the class they reference,
 // so that when a NamespaceClass changes we can look up every Namespace that
 // points at it without a full O(n) scan on every reconcile.
+// This index is maintained automatically whenever the informer sees a Namespace add/update/delete event.
 const byNamespaceClassIndex = "byNamespaceClass"
 
 func nsClassNameIndexFunc(obj interface{}) ([]string, error) {
@@ -153,14 +152,14 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
-	klog.Info("Controller synced, starting workers...")
+	klog.V(1).Info("Controller synced, starting workers...")
 
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
 
 	<-stopCh
-	klog.Info("Shutting down controller")
+	klog.V(1).Info("Shutting down controller")
 	return nil
 }
 
@@ -214,13 +213,13 @@ func (c *Controller) reconcileNamespace(name string) error {
 		return err
 	}
 	if !exists {
-		klog.Infof("Namespace %q no longer exists, skipping", name)
+		klog.V(1).Infof("Namespace %q no longer exists, skipping", name)
 		// TODO: Do we need to remove it from indexing?
 		return nil
 	}
 	ns := obj.(*unstructured.Unstructured)
 
-	klog.Infof("Reconciling Namespace: %s", ns.GetName())
+	klog.V(1).Infof("Reconciling Namespace: %s", ns.GetName())
 	labels := ns.GetLabels()
 	if len(labels) == 0 {
 		klog.V(2).Info("  (no labels)")
@@ -231,7 +230,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 
 	className, ok := labels[namespaceClassLabel]
 	if !ok || className == "" {
-		klog.V(1).Info("  no NamespaceClass reference")
+		klog.V(2).Info("  no NamespaceClass reference")
 		return nil
 	}
 
@@ -248,7 +247,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 		return nil
 	}
 	class := classObj.(*unstructured.Unstructured)
-	klog.V(1).Infof("  belongs to NamespaceClass %q (spec: %v)", class.GetName(), class.Object["spec"])
+	klog.V(2).Infof("  belongs to NamespaceClass %q (spec: %v)", class.GetName(), class.Object["spec"])
 
 	// Reconcile logic below.
 
@@ -256,7 +255,7 @@ func (c *Controller) reconcileNamespace(name string) error {
 	lastClassName, found := labels[lastNamespaceClassLabel]
 	if !found {
 		// there was no last class label, so we should apply the current class and set the last-applied label
-		klog.Infof("  no last-applied class label found, applying current class and setting last-applied label")
+		klog.V(1).Infof("  no last-applied class label found, applying current class and setting last-applied label")
 
 		// apply current class to namespace (e.g., create/update resources based on class spec)
 		err := c.applyDiffToNamespace(name, resourcesFromUnstructured(class), nil)
@@ -271,37 +270,56 @@ func (c *Controller) reconcileNamespace(name string) error {
 			return fmt.Errorf("error updating namespace %q with last-applied class label: %v", name, err)
 		}
 	} else if lastClassName != className {
-		klog.Infof("  last-applied class label %q differs from current class %q, updating resources and applying new class", lastClassName, className)
-		// get last class object by name from server
-		// TODO: Can we use our indexer to get this faster/easier?
-		lastClassObj, err := c.dynamicClient.Resource(namespaceClassGVR).Get(context.TODO(), lastClassName, metav1.GetOptions{})
+		klog.V(1).Infof("  last-applied class label %q differs from current class %q, updating resources and applying new class", lastClassName, className)
+		// Try to get the last-applied NamespaceClass from our informer cache first
+		// (cheap, avoids a live API call). Fall back to a live GET if not present
+		// in the cache. If neither exists, proceed to apply the new class but do
+		// not attempt cleanup of old resources.
+		cacheObj, exists, err := c.nsClassInformer.GetIndexer().GetByKey(lastClassName)
 		if err != nil {
-			if apierrors.IsNotFound(err) {
-				// if we can't find the last class, we can't remove any resources from it, but we can still apply the new class
-				// so don't return, just log a message and continue
-				klog.Warningf("  previous NamespaceClass %q not found on server, nothing to clean up", lastClassName)
+			return fmt.Errorf("error reading previous NamespaceClass %q from cache: %v", lastClassName, err)
+		}
+
+		var lastClass *unstructured.Unstructured
+		if exists {
+			if u, ok := cacheObj.(*unstructured.Unstructured); ok {
+				lastClass = u
 			} else {
-				return fmt.Errorf("error retrieving previous NamespaceClass %q: %v", lastClassName, err)
+				return fmt.Errorf("unexpected cached type for NamespaceClass %q", lastClassName)
 			}
 		} else {
-			// lastClassObj is an *unstructured.Unstructured
-			// but we do know its format from the CRD.
-			// TODO: Update here if we decide to make a typed client.
-			lastClass := lastClassObj
-			klog.V(2).Infof("  previous NamespaceClass %q (spec: %v) retrieved from server", lastClass.GetName(), lastClass.Object["spec"])
+			// Not in cache; try a live GET.
+			klog.V(2).Infof("previous NamespaceClass %q not found in informer cache, falling back to live GET", lastClassName)
+			liveObj, err := c.dynamicClient.Resource(namespaceClassGVR).Get(context.TODO(), lastClassName, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					klog.Warningf("  previous NamespaceClass %q not found on server, nothing to clean up", lastClassName)
+					lastClass = nil
+				} else {
+					return fmt.Errorf("error retrieving previous NamespaceClass %q: %v", lastClassName, err)
+				}
+			} else {
+				lastClass = liveObj
+			}
+		}
+
+		if lastClass != nil {
+			klog.V(2).Infof("  previous NamespaceClass %q (spec: %v) retrieved", lastClass.GetName(), lastClass.Object["spec"])
 
 			add, remove := diffNamespaceClassSpecs(resourcesFromUnstructured(lastClass), resourcesFromUnstructured(class))
 			klog.V(2).Infof("  resources to add: %v", add)
 			klog.V(2).Infof("  resources to remove: %v", remove)
-			err := c.applyDiffToNamespace(name, add, remove)
-
-			// update the namespace with the last-applied class label
-			labels[lastNamespaceClassLabel] = className
-			ns.SetLabels(labels)
-			_, err = c.dynamicClient.Resource(namespaceGVR).Update(context.TODO(), ns, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("error updating namespace %q with last-applied class label: %v", name, err)
+			if err := c.applyDiffToNamespace(name, add, remove); err != nil {
+				return fmt.Errorf("error applying diff from previous NamespaceClass %q to namespace %q: %v", lastClassName, name, err)
 			}
+		}
+
+		// update the namespace with the last-applied class label
+		labels[lastNamespaceClassLabel] = className
+		ns.SetLabels(labels)
+		_, err = c.dynamicClient.Resource(namespaceGVR).Update(context.TODO(), ns, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("error updating namespace %q with last-applied class label: %v", name, err)
 		}
 	} else {
 		klog.V(1).Info("  last-applied class label matches current class, no action needed")
@@ -318,11 +336,11 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 		return err
 	}
 	if !exists {
-		klog.Infof("NamespaceClass %q no longer exists, skipping", name)
+		klog.V(1).Infof("NamespaceClass %q no longer exists, skipping", name)
 		return nil
 	}
 	class := obj.(*unstructured.Unstructured)
-	klog.Infof("Reconciling NamespaceClass: %s )", class.GetName())
+	klog.V(1).Infof("Reconciling NamespaceClass: %s )", class.GetName())
 	klog.V(2).Infof("  spec: %v", class.Object["spec"])
 	affected, err := c.nsClassIndexer.ByIndex(byNamespaceClassIndex, name)
 	if err != nil {
@@ -396,8 +414,7 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 	return nil
 }
 
-// diffNamespaceClassSpecs compares two NamespaceClass unstructured objects and
-// returns two slices:
+// diffNamespaceClassSpecs compares two sets of objects (from the `spec.resources` field of a NamespaceClass) and returns two slices:
 // - items present in `class` but not in `lastClass` (to add)
 // - items present in `lastClass` but not in `class` (to remove)
 // Each item is represented as a map[string]interface{} as it appears in the
@@ -447,6 +464,9 @@ func diffNamespaceClassSpecs(last, cur []map[string]interface{}) (add []map[stri
 // NamespaceClass unstructured object and returns it as a slice of
 // map[string]interface{}. It tolerates missing fields and different
 // underlying types coming from the API.
+// TODO: This would be simpler with a typed clientset for NamespaceClass,
+// which would give compile-time type safety and avoid the need to use
+// unstructured.Unstructured.
 func resourcesFromUnstructured(u *unstructured.Unstructured) []map[string]interface{} {
 	if u == nil {
 		return nil
@@ -495,9 +515,11 @@ func prevResourcesFromUnstructured(u *unstructured.Unstructured) []map[string]in
 	return out
 }
 
+// applyDiffToNamespace applies a set of resource additions and removals to a given namespace.
+// Currently, it supports ServiceAccount, ConfigMap, and NetworkPolicy.
+// It creates or updates resources in the `add` slice and deletes resources in the `remove` slice.
+// Returns an error if any operation fails but will proceed with other operations even if one fails, collecting the first error encountered.
 func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{}, remove []map[string]interface{}) error {
-	var firstErr error
-
 	// Helper to map a simple type string to a GVR, apiVersion and kind
 	// TODO: If we decide to support more resource types, support would go here.
 	mapType := func(t string) (schema.GroupVersionResource, string, string, bool) {
@@ -514,11 +536,14 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 	}
 
 	// Create or update items in `add`.
+	addError := false
+	removeError := false
 	for _, item := range add {
 		traw, okT := item["type"]
 		nraw, okN := item["name"]
 		if !okT || !okN {
 			klog.Warningf("skipping malformed resource entry (missing type or name): %v", item)
+			addError = true
 			continue
 		}
 		t := fmt.Sprintf("%v", traw)
@@ -526,6 +551,7 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 		gvr, apiVersion, kind, ok := mapType(t)
 		if !ok {
 			klog.Warningf("unsupported resource type %q, skipping", t)
+			addError = true
 			continue
 		}
 
@@ -553,21 +579,17 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 		cancel()
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				klog.V(1).Infof("creating %s %s/%s", t, ns, name)
+				klog.Infof("creating %s %s/%s", t, ns, name)
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				if _, err := resIf.Create(ctx, obj, metav1.CreateOptions{}); err != nil {
 					klog.Errorf("error creating %s %s/%s: %v", t, ns, name, err)
-					if firstErr == nil {
-						firstErr = err
-					}
+					addError = true
 				}
 				cancel()
 				continue
 			}
 			klog.Errorf("error fetching existing %s %s/%s: %v", t, ns, name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
+			addError = true
 			continue
 		}
 
@@ -584,8 +606,14 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 			}
 		}
 
-		klog.V(1).Infof("updating %s %s/%s", t, ns, name)
+		klog.Infof("updating %s %s/%s", t, ns, name)
 		// Try an update with retry on conflict.
+		// TODO: I'm not sure if we should be doing any updates at all.
+		// It may be better to ignore any items that already exist and
+		// only create new ones, to avoid overwriting user changes.
+		// This is a design decision that isn't covered by the assignment spec.
+		// My personal belief is that we should always prioritize user changes
+		// over the NSC spec, so we should not update existing resources.
 		updateErr := func() error {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -600,9 +628,7 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 				cancel()
 				if err != nil {
 					klog.Errorf("error re-getting %s %s/%s after conflict: %v", t, ns, name, err)
-					if firstErr == nil {
-						firstErr = err
-					}
+					addError = true
 					continue
 				}
 				// re-apply desired fields
@@ -618,16 +644,12 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 				ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
 				if _, err := resIf.Update(ctx, fresh, metav1.UpdateOptions{}); err != nil {
 					klog.Errorf("error updating %s %s/%s after retry: %v", t, ns, name, err)
-					if firstErr == nil {
-						firstErr = err
-					}
+					addError = true
 				}
 				cancel()
 			} else {
 				klog.Errorf("error updating %s %s/%s: %v", t, ns, name, updateErr)
-				if firstErr == nil {
-					firstErr = updateErr
-				}
+				addError = true
 			}
 		}
 	}
@@ -638,6 +660,7 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 		nraw, okN := item["name"]
 		if !okT || !okN {
 			klog.Warningf("skipping malformed resource entry (missing type or name): %v", item)
+			removeError = true
 			continue
 		}
 		t := fmt.Sprintf("%v", traw)
@@ -645,23 +668,26 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 		gvr, _, _, ok := mapType(t)
 		if !ok {
 			klog.Warningf("unsupported resource type %q for deletion, skipping", t)
+			removeError = true
 			continue
 		}
 
-		klog.V(1).Infof("deleting %s %s/%s", t, ns, name)
+		klog.Infof("deleting %s %s/%s", t, ns, name)
 		if err := c.dynamicClient.Resource(gvr).Namespace(ns).Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
 			if apierrors.IsNotFound(err) {
 				klog.V(2).Infof("resource %s %s/%s already absent", t, ns, name)
 				continue
 			}
 			klog.Errorf("error deleting %s %s/%s: %v", t, ns, name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
+			removeError = true
 		}
 	}
 
-	return firstErr
+	if addError || removeError {
+		return fmt.Errorf("one or more errors occurred during applyDiffToNamespace for namespace %q", ns)
+	}
+
+	return nil
 }
 
 func main() {
@@ -693,8 +719,3 @@ func main() {
 		panic(err.Error())
 	}
 }
-
-// TODO: Not really sure what these do, revisit.
-var _ = apierrors.IsConflict
-var _ = context.Background
-var _ = metav1.ListOptions{}
