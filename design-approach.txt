@@ -84,3 +84,5 @@ Also improved the retrieval of NSC in namespace reconcile to use the indexer and
 This comes with upgrades to the README to help iron out the remaining questions, issues, and steps forward. 
 After all of my cleanup/code changes, the operator still behaves as expected and the tests still perform as I would like them to. 
 I would call the work 'complete' at this stage. Unit tests, gofmpt, govet, etc are nice-to-haves that I will attempt to add in before submission.
+
+One last commit, to polish up the documentation and add some basic unit tests-- and a mutex on the namespace access, as I witnessed occasional attempts to create an asset twice in testing, because of a race condition. As of this stage, I think the solution achieves what it was meant to do, and I do not have any present plans to extend the NamespaceClass controller further. 

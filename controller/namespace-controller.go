@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"time"
+    "sync"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -77,6 +78,9 @@ type Controller struct {
 	nsClassInformer cache.SharedIndexInformer
 	nsClassIndexer  cache.Indexer // indexed so we can find namespaces by class cheaply
 	queue           workqueue.RateLimitingInterface
+	// per-namespace locks to serialize reconciliation for the same namespace
+	locks   map[string]*sync.Mutex
+	locksMu sync.Mutex
 }
 
 // nsClassNameIndexer indexes Namespace objects by the class they reference,
@@ -84,6 +88,42 @@ type Controller struct {
 // points at it without a full O(n) scan on every reconcile.
 // This index is maintained automatically whenever the informer sees a Namespace add/update/delete event.
 const byNamespaceClassIndex = "byNamespaceClass"
+
+func main() {
+	klog.InitFlags(nil)
+	// set klog verbosity from the compile-time `logVerbosity` constant so
+	// klog.V(<n>) checks behave according to our chosen default.
+	flag.Set("v", fmt.Sprintf("%d", logVerbosity))
+	flag.Parse()
+	defer klog.Flush()
+
+	// set up access to the cluster via kubeconfig
+	// this is only for local use, production would need better config handling
+	kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		panic(err.Error())
+	}
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// set up the dynamic informer factory and controller
+	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 30*time.Second)
+	controller := NewController(dynamicClient, factory)
+
+	// run the controller with 2 workers and a stop channel
+	// 2 workers should be enough, namespaces shouldn't be
+	// getting created or changing classes often, but we could
+	// make this configurable if needed.
+	stopCh := make(chan struct{}) // nothing will ever close this, we could wire it to OS signals
+	defer close(stopCh)
+
+	if err := controller.Run(2, stopCh); err != nil {
+		panic(err.Error())
+	}
+}
 
 func nsClassNameIndexFunc(obj interface{}) ([]string, error) {
 	u, ok := obj.(*unstructured.Unstructured)
@@ -98,6 +138,8 @@ func nsClassNameIndexFunc(obj interface{}) ([]string, error) {
 	return []string{class}, nil
 }
 
+// Build a controller that watches Namespaces and NamespaceClasses, and enqueues them for reconciliation.
+// This includes an indexer on Namespaces by the class they reference, so that when a NamespaceClass changes we can look up every Namespace that points at it without a full O(n) scan on every reconcile.
 func NewController(dynamicClient dynamic.Interface, factory dynamicinformer.DynamicSharedInformerFactory) *Controller {
 	nsInformer := factory.ForResource(namespaceGVR).Informer()
 	nsClassInformer := factory.ForResource(namespaceClassGVR).Informer()
@@ -114,6 +156,7 @@ func NewController(dynamicClient dynamic.Interface, factory dynamicinformer.Dyna
 		nsClassInformer: nsClassInformer,
 		nsClassIndexer:  nsInformer.GetIndexer(),
 		queue:           workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		locks:           make(map[string]*sync.Mutex),
 	}
 
 	nsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -139,6 +182,20 @@ func (c *Controller) enqueue(kind string, obj interface{}) {
 	}
 	// Both types are cluster-scoped, so key is just the name (no "ns/name" split needed).
 	c.queue.Add(queueKey{kind: kind, name: key})
+}
+
+// getNamespaceLock returns a mutex for the given namespace, creating it if
+// necessary. The caller should call Lock/Unlock on the returned mutex to
+// serialize operations for that namespace.
+func (c *Controller) getNamespaceLock(ns string) *sync.Mutex {
+	c.locksMu.Lock()
+	defer c.locksMu.Unlock()
+	m, ok := c.locks[ns]
+	if !ok {
+		m = &sync.Mutex{}
+		c.locks[ns] = m
+	}
+	return m
 }
 
 func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
@@ -520,6 +577,11 @@ func prevResourcesFromUnstructured(u *unstructured.Unstructured) []map[string]in
 // It creates or updates resources in the `add` slice and deletes resources in the `remove` slice.
 // Returns an error if any operation fails but will proceed with other operations even if one fails, collecting the first error encountered.
 func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{}, remove []map[string]interface{}) error {
+	// Serialize mutations for this namespace so two workers don't race to create
+	// the same object concurrently.
+	lock := c.getNamespaceLock(ns)
+	lock.Lock()
+	defer lock.Unlock()
 	// Helper to map a simple type string to a GVR, apiVersion and kind
 	// TODO: If we decide to support more resource types, support would go here.
 	mapType := func(t string) (schema.GroupVersionResource, string, string, bool) {
@@ -688,34 +750,4 @@ func (c *Controller) applyDiffToNamespace(ns string, add []map[string]interface{
 	}
 
 	return nil
-}
-
-func main() {
-	klog.InitFlags(nil)
-	// set klog verbosity from the compile-time `logVerbosity` constant so
-	// klog.V(<n>) checks behave according to our chosen default.
-	flag.Set("v", fmt.Sprintf("%d", logVerbosity))
-	flag.Parse()
-	defer klog.Flush()
-	kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	dynamicClient, err := dynamic.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, 30*time.Second)
-
-	controller := NewController(dynamicClient, factory)
-
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-
-	if err := controller.Run(2, stopCh); err != nil {
-		panic(err.Error())
-	}
 }
