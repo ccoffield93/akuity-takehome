@@ -261,9 +261,9 @@ func (c *Controller) processNextItem() bool {
 	return true
 }
 
-// reconcileNamespace handles a single Namespace: prints its labels and, if it
-// references a NamespaceClass, looks that class up (from the local informer
-// cache, not a live API call) and prints it too.
+// reconcileNamespace handles a single Namespace: if the namespace class has been changed, 
+// it updates the resources in the namespace to match the new namespace class. This means
+// deleting the old class' resources and adding the new ones.
 func (c *Controller) reconcileNamespace(name string) error {
 	obj, exists, err := c.nsInformer.GetIndexer().GetByKey(name)
 	if err != nil {
@@ -271,13 +271,14 @@ func (c *Controller) reconcileNamespace(name string) error {
 	}
 	if !exists {
 		klog.V(1).Infof("Namespace %q no longer exists, skipping", name)
-		// TODO: Do we need to remove it from indexing?
+		// We don't need to remove it from indexing, that's handled automatically. 
 		return nil
 	}
 	ns := obj.(*unstructured.Unstructured)
 
 	klog.V(1).Infof("Reconciling Namespace: %s", ns.GetName())
 	labels := ns.GetLabels()
+	// printing labels will flood the logs, so make those require higher verbosity.
 	if len(labels) == 0 {
 		klog.V(2).Info("  (no labels)")
 	}
@@ -299,7 +300,8 @@ func (c *Controller) reconcileNamespace(name string) error {
 		// Referenced class doesn't exist (yet, or was deleted). Depending on
 		// your policy this might warrant an event/condition on the namespace;
 		// returning an error here would cause a retry with backoff instead.
-		// TODO: Shift this into warning, not just printf.
+		// This WON'T cause an issue with the NSC not applying if it's created later,
+		// because this NS will not have a 'last class' label until it's given at least one class.
 		klog.Warningf("  references NamespaceClass %q, which was not found", className)
 		return nil
 	}
@@ -386,7 +388,11 @@ func (c *Controller) reconcileNamespace(name string) error {
 
 // reconcileNamespaceClass handles a NamespaceClass change. Since a class
 // change can affect every namespace that references it, it looks up all
-// such namespaces via the index and re-enqueues them for reconciliation.
+// such namespaces via the index and handles their asset creation.
+// TODO: This is a semi-blocking action, and therefore somewhat expensive. 
+// If this codepath becomes heavily trafficked (lots of class changes), 
+// we may want to think of ways to more efficiently create/delete the 
+// resources. Same for if we have MANY namespaces using a class. 
 func (c *Controller) reconcileNamespaceClass(name string) error {
 	obj, exists, err := c.nsClassInformer.GetIndexer().GetByKey(name)
 	if err != nil {
@@ -404,7 +410,7 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 		return err
 	}
 
-	klog.V(1).Infof("  %d namespace(s) reference this class", len(affected))
+	klog.V(2).Infof("  %d namespace(s) reference this class", len(affected))
 
 	// We must ONLY delete resources that were created by previous application of the NSC.
 	// If the NSC spec changes, we must figure out what changed and only delete resources that were created by the previous spec.
@@ -462,7 +468,7 @@ func (c *Controller) reconcileNamespaceClass(name string) error {
 		}
 		spec["lastResources"] = newResources
 		class.Object["spec"] = spec
-		_, err = c.dynamicClient.Resource(namespaceClassGVR).Update(context.TODO(), class, metav1.UpdateOptions{})
+		_, err = c.dynamicClient.Resource(namespaceClassGVR).Update(context.Background(), class, metav1.UpdateOptions{})
 		if err != nil {
 			klog.Errorf("  error updating NamespaceClass %q with last-applied resources: %v", name, err)
 		}
@@ -548,6 +554,9 @@ func resourcesFromUnstructured(u *unstructured.Unstructured) []map[string]interf
 // prevResourcesFromUnstructured extracts `spec.lastResources` from a
 // NamespaceClass unstructured object and returns it as a slice of
 // map[string]interface{}. Returns nil if the field is missing, empty, or malformed.
+// TODO: Merge this into resourcesFromUnstructured: have it return two lists, with nil 
+// 'previous' list should it not exist/be empty. Consumers can just ignore prev resources
+// if they don't need them.
 func prevResourcesFromUnstructured(u *unstructured.Unstructured) []map[string]interface{} {
 	if u == nil {
 		return nil
